@@ -125,6 +125,71 @@ class MCPServerScraper:
             html = f.read()
         return self.parse_server_data(html)
 
+    def fetch_api_data(self, page: int = 1, page_size: int = 20) -> List[Dict]:
+        """Fetch data directly from ModelScope API"""
+        api_url = "https://www.modelscope.cn/api/v1/mcp/list"
+
+        params = {
+            'PageNumber': page,
+            'PageSize': page_size,
+            'SortBy': 'GmtModified'  # or 'GmtCreate', 'Stars', etc.
+        }
+
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Referer': 'https://www.modelscope.cn/mcp',
+            'Origin': 'https://www.modelscope.cn'
+        }
+
+        try:
+            print(f"Fetching API data for page {page}...")
+            response = self.session.get(api_url, params=params, headers=headers, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get('Success') and 'Data' in data:
+                items = data['Data'].get('Data', [])
+                total = data['Data'].get('TotalCount', 0)
+                print(f"API returned {len(items)} items (Total: {total})")
+                return self._parse_api_response(items)
+            else:
+                print(f"API response format unexpected: {data}")
+                return []
+
+        except Exception as e:
+            print(f"Error fetching from API: {e}")
+            return []
+
+    def _parse_api_response(self, items: List[Dict]) -> List[Dict]:
+        """Parse server data from API response"""
+        servers = []
+
+        for item in items:
+            try:
+                server = {
+                    'name': item.get('Name', ''),
+                    'developer': item.get('Author', '') or item.get('Organization', ''),
+                    'type': 'hosted' if item.get('Type') == 'hosted' else 'local',
+                    'description': item.get('Description', '') or item.get('ChineseDescription', ''),
+                    'views': str(item.get('ViewCount', 0) or item.get('VisitCount', 0)),
+                    'api_calls': str(item.get('ApiCallCount', '')) if item.get('Type') == 'hosted' else ''
+                }
+
+                # Clean up developer name
+                if server['developer'] and 'from' not in server['developer'].lower():
+                    org = item.get('Organization', '')
+                    if org:
+                        server['developer'] = f"{server['developer']} from {org}"
+
+                servers.append(server)
+
+            except Exception as e:
+                print(f"Error parsing API item: {e}")
+                continue
+
+        return servers
+
     def parse_server_data(self, html: str) -> List[Dict]:
         """Parse MCP server data from HTML"""
         soup = BeautifulSoup(html, 'html.parser')
@@ -261,11 +326,59 @@ class MCPServerScraper:
         # Assume ~20 items per page as default
         return 380  # 7599 / 20 ≈ 380 pages
 
-    def scrape_all(self, max_pages: int = None, output_file: str = 'mcp_servers.csv') -> List[Dict]:
+    def scrape_all(self, max_pages: int = None, output_file: str = 'mcp_servers.csv', use_api: bool = True) -> List[Dict]:
         """Scrape all pages and save to CSV"""
         all_servers = []
 
-        # Fetch first page to determine total pages
+        # Try API method first (much faster and more reliable)
+        if use_api and not self.use_selenium:
+            print("Attempting to fetch data from API...")
+            try:
+                # Get first page to determine total
+                page_size = 20
+                servers = self.fetch_api_data(1, page_size)
+
+                if servers:
+                    all_servers.extend(servers)
+                    print(f"Page 1: Found {len(servers)} servers")
+
+                    # Calculate total pages needed
+                    # API typically returns totalCount, estimate ~380 pages for 7599 items
+                    if not max_pages:
+                        max_pages = 380  # Adjust based on actual total from API
+
+                    # Fetch remaining pages
+                    for page in range(2, max_pages + 1):
+                        try:
+                            time.sleep(0.5)  # Be polite
+                            servers = self.fetch_api_data(page, page_size)
+
+                            if not servers:
+                                print("No more servers found. Stopping.")
+                                break
+
+                            all_servers.extend(servers)
+                            print(f"Page {page}: Found {len(servers)} servers (Total: {len(all_servers)})")
+
+                        except KeyboardInterrupt:
+                            print("\nScraping interrupted by user.")
+                            break
+                        except Exception as e:
+                            print(f"Error on page {page}: {e}")
+                            continue
+
+                    # Save and return if API worked
+                    if all_servers:
+                        self.save_to_csv(all_servers, output_file)
+                        print(f"\nTotal servers scraped: {len(all_servers)}")
+                        print(f"Data saved to: {output_file}")
+                        return all_servers
+
+            except Exception as e:
+                print(f"API method failed: {e}")
+                print("Falling back to HTML parsing method...")
+
+        # Fallback: HTML parsing method
         print("Fetching first page to determine structure...")
         first_page_html = self.fetch_page(1)
 
